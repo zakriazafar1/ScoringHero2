@@ -12,17 +12,17 @@ from pathlib import Path          # voor bestandspaden (werkt op Windows en Mac)
 import numpy as np                # numerieke berekeningen
 import pandas as pd               # data opslaan als tabel
 import mne                        # EDF bestanden inladen
-
+from tqdm import tqdm 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuratie — alle parameters op één plek
 # ══════════════════════════════════════════════════════════════════════════════
 
 base_dir   = Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR")
-output_dir = Path(r"C:\Users\zafar\Documents\bnbd_output2")
+output_dir = Path(r"C:\Users\zafar\Documents\bnbd_output3")
 output_dir.mkdir(exist_ok=True)   # maak output map aan als die nog niet bestaat
 
-MAX_PARTICIPANTS = 1         # hoeveel deelnemers je wilt verwerken (5 voor pilot)
+MAX_PARTICIPANTS = 5         # hoeveel deelnemers je wilt verwerken (5 voor pilot)
 
 EEG_CH = ['EEG L psg-lp', 'EEG R psg-lp']          # EEG kanalen links en rechts
 EMG_CH = ['EEG L psg-emg', 'EEG R psg-emg']         # EMG kanalen (spieractiviteit)
@@ -48,7 +48,7 @@ BANDS = {
 }
 
 ROLLING_SEC            = 60.0   # baseline venster: vergelijk met de vorige 60 seconden
-AROUSAL_FREQ_THRESHOLD = 8.0    # ridge moet > 8 Hz boven baseline springen = activatie
+AROUSAL_FREQ_THRESHOLD = 3.0    # ridge moet > 3 Hz boven baseline springen = activatie
 AROUSAL_MIN_DUR        = 3.0    # event moet minimaal 3 seconden duren
 AROUSAL_MAX_DUR        = 30.0   # event mag maximaal 30 seconden duren
 
@@ -140,7 +140,7 @@ def compute_morlet_tf(signal, srate, freqs, n_cycles=None, L2normalize=False):
     power = np.empty((len(freqs), n_samples), dtype=np.float32)
 
     # bereken voor elke doelfrequentie de power
-    for i, freq in enumerate(freqs):
+    for i, freq in enumerate(tqdm(freqs, desc="CWT", leave=False)):
         # sigma_f = breedte van de Gaussiaanse envelop in frequentiedomein
         sigma_f = freq / n_cycles_arr[i]
 
@@ -200,37 +200,20 @@ def extract_ridge(power, freqs):
 
 def compute_freq_shift(ridge_freq, srate, baseline_sec=ROLLING_SEC):
     """
-    Berekent hoe ver de ridge omhoog springt t.o.v. de lokale baseline.
-
-    Baseline = mediaan van de ridge over de vorige 60 seconden.
-    freq_shift = ridge_freq - baseline
-
-    Positief = ridge springt omhoog = activatie = kandidaat-event
-    Negatief = ridge daalt = normale slaap of verdieping
-
-    We gebruiken mediaan (niet gemiddelde) omdat die robuust is
-    tegen uitschieters — één piek beïnvloedt de mediaan nauwelijks.
+    Snelle vectorized versie — gebruikt pandas rolling mediaan.
+    Zelfde resultaat, maar seconden in plaats van minuten.
     """
-    baseline_samp = int(baseline_sec * srate)  # 60 sec × 256 = 15360 samples
-
-    baseline = np.empty_like(ridge_freq)
-
-    for i in range(len(ridge_freq)):
-        # kijk terug: van i-15360 tot i (of van 0 als i < 15360)
-        start = max(0, i - baseline_samp)
-
-        if i == 0:
-            # eerste sample: geen baseline beschikbaar, gebruik huidige waarde
-            baseline[i] = ridge_freq[0]
-        else:
-            # mediaan van alle voorgaande samples in het venster
-            baseline[i] = np.median(ridge_freq[start:i])
-
-    # freq_shift: hoe ver zit de ridge boven de baseline?
+    import pandas as pd
+    
+    window = int(baseline_sec * srate)   # 60 sec × 256 = 15360 samples
+    
+    # pandas rolling mediaan is sterk geoptimaliseerd
+    series   = pd.Series(ridge_freq)
+    baseline = series.rolling(window=window, min_periods=1).median().values
+    
     freq_shift = ridge_freq - baseline
-
+    
     return freq_shift, baseline
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Fase 5 — Kandidaat-event detectie
@@ -430,6 +413,12 @@ def process_one_night(edf_path, subject_id, night_id):
     7. Label artefacten
     8. Geef terug als DataFrame
     """
+    # check of dit bestand al verwerkt is
+    night_out = output_dir / f"{subject_id}_{night_id}_events.csv"
+    if night_out.exists():
+        print(f"  Al verwerkt, overgeslagen: {night_out.name}")
+        return pd.read_csv(night_out)   # laad bestaand resultaat
+    
     print(f"\n{'='*60}")
     print(f"Verwerken: {subject_id} / {night_id}")
     print(f"Bestand:   {edf_path}")
@@ -518,6 +507,7 @@ def process_one_night(edf_path, subject_id, night_id):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_all_nights():
+
     """
     Zoekt alle EDF bestanden op, verwerkt ze één voor één,
     en slaat resultaten op per nacht en als één grote master tabel.
@@ -530,34 +520,38 @@ def run_all_nights():
     └── sub_002/
         └── ...
     """
-    # zoek alle EDF bestanden recursief in de map
-    all_edf = sorted(base_dir.rglob("*.edf"))
-    print(f"Gevonden: {len(all_edf)} EDF bestanden")
-
+    # zoek alleen naar bestanden die eindigen op _psg.edf
+    # dit sluit BATT.edf en andere niet-PSG bestanden uit
+    all_edf = sorted(base_dir.rglob("*_psg.edf"))
+    
+    print(f"Gevonden: {len(all_edf)} PSG bestanden")
+    
     if len(all_edf) == 0:
-        print("Geen EDF bestanden gevonden. Controleer base_dir.")
+        print("Geen PSG bestanden gevonden. Controleer base_dir.")
         return pd.DataFrame()
 
     # begrens tot MAX_PARTICIPANTS voor pilot
     all_edf = all_edf[:MAX_PARTICIPANTS]
     print(f"Verwerken: {len(all_edf)} bestanden (MAX_PARTICIPANTS={MAX_PARTICIPANTS})")
 
-    all_dfs = []   # verzamelt DataFrames van alle nachten
+    all_dfs = []
 
     for i, edf_path in enumerate(all_edf):
-        # maak subject_id en night_id uit de bestandsnaam
-        # pas dit aan als jouw mappenstructuur anders is
-        subject_id = edf_path.parent.name   # naam van de bovenliggende map
-        night_id   = edf_path.stem          # bestandsnaam zonder .edf
+        # haal subject_id en night_id uit de bestandsnaam
+        # bestandsnaam: bnbd_nsr_03554_T0_N1_psg.edf
+        # stem (zonder .edf): bnbd_nsr_03554_T0_N1_psg
+        stem = edf_path.stem                      
+        parts = stem.replace("_psg", "").split("_")
+        
+        subject_id = f"bnbd_nsr_{parts[2]}"         
+        night_id   = f"{parts[3]}_{parts[4]}"       
 
         try:
-            # verwerk één nacht
             df = process_one_night(edf_path, subject_id, night_id)
 
             if df.empty:
-                continue   # sla over als geen events gevonden
+                continue
 
-            # sla op per nacht als CSV
             night_out = output_dir / f"{subject_id}_{night_id}_events.csv"
             df.to_csv(night_out, index=False)
             print(f"  Opgeslagen: {night_out.name}")
@@ -565,7 +559,6 @@ def run_all_nights():
             all_dfs.append(df)
 
         except Exception as e:
-            # als één nacht mislukt, ga door met de rest
             print(f"  FOUT bij {edf_path.name}: {e}")
             continue
 
@@ -573,23 +566,19 @@ def run_all_nights():
         print("Geen events gevonden over alle nachten.")
         return pd.DataFrame()
 
-    # combineer alle nachten tot één grote tabel
     master = pd.concat(all_dfs, ignore_index=True)
-
-    # sla master tabel op
     master_out = output_dir / "master_events.csv"
     master.to_csv(master_out, index=False)
 
     print(f"\n{'='*60}")
     print(f"KLAAR")
-    print(f"Totaal events:       {len(master)}")
-    print(f"Unieke deelnemers:   {master['subject_id'].nunique()}")
-    print(f"Schone events:       {(master['artifact_label']=='clean').sum()}")
-    print(f"Artefact events:     {(master['artifact_label']!='clean').sum()}")
-    print(f"Master tabel:        {master_out}")
+    print(f"Totaal events:     {len(master)}")
+    print(f"Deelnemers:        {master['subject_id'].nunique()}")
+    print(f"Schone events:     {(master['artifact_label']=='clean').sum()}")
+    print(f"Artefact events:   {(master['artifact_label']!='clean').sum()}")
+    print(f"Master tabel:      {master_out}")
 
     return master
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Kwaliteitscontrole — controleer of de pipeline werkt
