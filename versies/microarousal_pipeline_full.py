@@ -19,10 +19,10 @@ from tqdm import tqdm
 # ══════════════════════════════════════════════════════════════════════════════
 
 base_dir   = Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR")
-output_dir = Path(r"C:\Users\zafar\Documents\bnbd_output3")
+output_dir = Path(r"C:\Users\zafar\Documents\bnbd_output4")
 output_dir.mkdir(exist_ok=True)   # maak output map aan als die nog niet bestaat
 
-MAX_PARTICIPANTS = 5         # hoeveel deelnemers je wilt verwerken (5 voor pilot)
+MAX_PARTICIPANTS = 3      # hoeveel deelnemers je wilt verwerken (5 voor pilot)
 
 EEG_CH = ['EEG L psg-lp', 'EEG R psg-lp']          # EEG kanalen links en rechts
 EMG_CH = ['EEG L psg-emg', 'EEG R psg-emg']         # EMG kanalen (spieractiviteit)
@@ -39,7 +39,7 @@ STEP_SAMP = int(STEP_SEC * SFREQ) # stap in samples: 0.5 × 256 = 128 samples
 # dit geeft 70 frequenties totaal
 FREQS = np.arange(0.5, 35.5, 0.5)
 
-# EEG frequentiebanden — gebruikt voor feature extractie per event
+# EEG frequentiebanden — gebruikt voor feature extractie per eventijm
 BANDS = {
     'delta': (0.5,  4.0),   # diepe slaap
     'theta': (4.0,  8.0),   # lichte slaap / drowsiness
@@ -48,9 +48,9 @@ BANDS = {
 }
 
 ROLLING_SEC            = 60.0   # baseline venster: vergelijk met de vorige 60 seconden
-AROUSAL_FREQ_THRESHOLD = 3.0    # ridge moet > 3 Hz boven baseline springen = activatie
-AROUSAL_MIN_DUR        = 3.0    # event moet minimaal 3 seconden duren
-AROUSAL_MAX_DUR        = 30.0   # event mag maximaal 30 seconden duren
+AROUSAL_FREQ_THRESHOLD = 0.5    # ridge moet > 0.5 Hz boven baseline springen = activatie
+AROUSAL_MIN_DUR        = 1.0    # event moet minimaal 1 seconden duren
+AROUSAL_MAX_DUR        = 20.0   # event mag maximaal 20 seconden duren
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,102 +96,85 @@ def preprocess_signals(raw):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Fase 2 — Morlet CWT (identiek aan Scoring Hero van supervisor)
+# Fase 2+3 — Morlet CWT + ridge extractie (streaming, geheugenefficiënt)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_morlet_tf(signal, srate, freqs, n_cycles=None, L2normalize=False):
+def compute_morlet_tf_streaming(signal, srate, freqs, bands, n_cycles=None, L2normalize=False):
     """
-    Berekent de Continuous Wavelet Transform via Morlet wavelets.
+    Berekent CWT zonder de volledige power matrix op te slaan.
 
-    Voor elke frequentie: maak een golfje (wavelet) en kijk hoe goed
-    dat golfje past op het signaal op elk tijdstip.
-    Hoe beter de match → hogere power.
+    Probleem met de originele aanpak: de power matrix (n_freqs × n_samples)
+    is ~1.93 GiB voor 8 uur data. NumPy's argmax heeft dan intern nog eens
+    ~1.93 GiB nodig voor een transposed copy → geheugen vol.
 
-    Output: power matrix van shape (n_freqs, n_samples)
-    Elke rij = één frequentie, elke kolom = één tijdstip
-    Kleur in Scoring Hero = de waarde in deze matrix
+    Oplossing: verwerk één frequentie tegelijk en bewaar alleen:
+    - ridge_max:   (n_samples,) — hoogste power per tijdstip
+    - ridge_idx:   (n_samples,) — welke freq-index die max had
+    - band_accum:  4 × (n_samples,) — opgetelde power per band
+
+    Totaal geheugen: ~168 MB i.p.v. ~1.93 GiB (11× minder)
+
+    Geeft terug:
+    - ridge_freq:  (n_samples,) — dominante frequentie in Hz
+    - ridge_power: (n_samples,) — power op die frequentie
+    - band_mean:   dict band_naam → (n_samples,) gemiddelde power per sample
     """
     freqs = np.asarray(freqs)
 
-    # n_cycles bepaalt de breedte van het golfje:
-    # - lage frequentie → breed golfje → goede tijdresolutie
-    # - hoge frequentie → smal golfje → goede frequentieresolutie
     if n_cycles is None:
-        n_cycles_arr = np.maximum(3.0, freqs / 2.0)   # slimme keuze van supervisor
+        n_cycles_arr = np.maximum(3.0, freqs / 2.0)
     elif np.isscalar(n_cycles):
         n_cycles_arr = np.full(len(freqs), float(n_cycles))
     else:
         n_cycles_arr = np.asarray(n_cycles, dtype=float)
 
     n_samples = len(signal)
-
-    # verwijder DC offset: vlakke lijn weghalen zodat het niet lekt
-    # naar lage frequenties (zou nep-delta power geven)
-    signal = signal - np.mean(signal)
-
-    # zet signaal om naar frequentiedomein (FFT = snelle fourier transform)
-    # dit is de basis voor de convolutie met elke wavelet
+    signal    = signal - np.mean(signal)
     signal_fft = np.fft.fft(signal)
+    fft_freqs  = np.fft.fftfreq(n_samples, d=1.0 / srate)
 
-    # frequentievector die hoort bij de FFT output
-    fft_freqs = np.fft.fftfreq(n_samples, d=1.0 / srate)
+    # Ridge accumulatoren — klein: elk (n_samples,) float32/uint8
+    ridge_max = np.full(n_samples, -np.inf, dtype=np.float32)
+    ridge_idx = np.zeros(n_samples, dtype=np.uint8)  # max 255 freqs, hier 70
 
-    # lege matrix om power in op te slaan
-    power = np.empty((len(freqs), n_samples), dtype=np.float32)
+    # Per-band power accumulatoren
+    band_accum = {name: np.zeros(n_samples, dtype=np.float32) for name in bands}
+    band_count = {name: 0 for name in bands}
 
-    # bereken voor elke doelfrequentie de power
     for i, freq in enumerate(tqdm(freqs, desc="CWT", leave=False)):
-        # sigma_f = breedte van de Gaussiaanse envelop in frequentiedomein
-        sigma_f = freq / n_cycles_arr[i]
-
-        # maak de wavelet als Gaussiaanse bel rondom de doelfrequentie
-        # hoge waarde bij freq, laag daaromheen
+        sigma_f     = freq / n_cycles_arr[i]
         wavelet_fft = np.exp(-0.5 * ((fft_freqs - freq) / sigma_f) ** 2)
 
-        # optioneel: normaliseer zodat power vergelijkbaar is over frequenties
         if L2normalize:
             wavelet_fft /= np.sqrt(np.sum(wavelet_fft ** 2))
 
-        # vermenigvuldig signaal met wavelet in frequentiedomein
-        # = convolutie in tijdsdomein (sneller via FFT)
-        analytic = np.fft.ifft(signal_fft * wavelet_fft)
+        analytic  = np.fft.ifft(signal_fft * wavelet_fft)
+        power_row = (np.abs(analytic) ** 2).astype(np.float32)  # (n_samples,)
 
-        # power = gekwadrateerde magnitude van het analytische signaal
-        # dit geeft de instantane energie op elk tijdstip
-        power[i] = np.abs(analytic) ** 2
+        # Update ridge: vervang waar deze frequentie hoger is
+        better = power_row > ridge_max
+        ridge_max[better] = power_row[better]
+        ridge_idx[better] = i
 
-    return power   # shape: (n_freqs, n_samples)
+        # Accumuleer band power
+        for name, (lo, hi) in bands.items():
+            if lo <= freq <= hi:
+                band_accum[name] += power_row
+                band_count[name] += 1
 
+    # Zet ridge index om naar Hz
+    ridge_freq  = freqs[ridge_idx]   # (n_samples,)
+    ridge_power = ridge_max          # (n_samples,)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Fase 3 — Ridge extractie
-# ══════════════════════════════════════════════════════════════════════════════
+    # Normaliseer band accumulatoren naar gemiddelde power per sample
+    band_mean = {}
+    for name in bands:
+        if band_count[name] > 0:
+            band_mean[name] = band_accum[name] / band_count[name]
+        else:
+            band_mean[name] = np.zeros(n_samples, dtype=np.float32)
 
-def extract_ridge(power, freqs):
-    """
-    Trekt de ridge uit de power matrix.
-
-    Ridge = per tijdstip de frequentie met de hoogste power.
-    Dit is de zwarte lijn die je ziet in Scoring Hero.
-
-    power: (n_freqs, n_samples)
-    freqs: (n_freqs,)
-
-    Geeft terug:
-    - ridge_freq:  (n_samples,) — dominante frequentie per tijdstip in Hz
-    - ridge_power: (n_samples,) — power op die dominante frequentie
-    """
-    # argmax over axis=0 = per tijdstip (kolom) de rij met hoogste waarde
-    ridge_idx = np.argmax(power, axis=0)   # geeft indices, niet Hz-waarden
-
-    # zet index om naar Hz via de freqs vector
-    ridge_freq = freqs[ridge_idx]          # shape: (n_samples,)
-
-    # pak de power op die index per tijdstip
-    # np.arange(n) maakt [0, 1, 2, ...] voor de kolomindex
-    ridge_power = power[ridge_idx, np.arange(power.shape[1])]
-
-    return ridge_freq, ridge_power
+    return ridge_freq, ridge_power, band_mean
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,14 +276,14 @@ def detect_events(ridge_freq, ridge_power, freq_shift, srate,
 # Fase 6 — Feature extractie per event
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_event_features(start, end, power, freqs, ridge_freq,
+def extract_event_features(start, end, band_mean, ridge_freq,
                             ridge_power, freq_shift, emg_signal, acc_signal,
                             srate):
     """
     Berekent alle features voor één event.
 
-    Gebruikt de power matrix (al berekend) om bandpowers te halen.
-    Dit is efficiënt: CWT wordt slechts één keer berekend per nacht.
+    Gebruikt band_mean arrays (al berekend tijdens streaming CWT) voor bandpowers.
+    band_mean: dict band_naam → (n_samples,) gemiddelde power per sample.
 
     Features:
     - timing: start, einde, duur
@@ -310,23 +293,11 @@ def extract_event_features(start, end, power, freqs, ridge_freq,
     - EMG: gemiddelde spieractiviteit tijdens event
     - beweging: gemiddelde accelerometer magnitude
     """
-    # slice de power matrix op het tijdvenster van dit event
-    # power[:, start:end] = alle frequenties, alleen de samples van dit event
-    pmat = power[:, start:end]   # shape: (n_freqs, event_duur)
-
-    # ── bandpowers ──
-    def bandpower(lo, hi):
-        # selecteer rijen (frequenties) die in de band vallen
-        mask = (freqs >= lo) & (freqs <= hi)
-        if mask.sum() == 0:
-            return 0.0
-        # gemiddelde power over die frequenties en over de tijd
-        return float(pmat[mask, :].mean())
-
-    delta = bandpower(*BANDS['delta'])   # 0.5–4 Hz
-    theta = bandpower(*BANDS['theta'])   # 4–8 Hz
-    alpha = bandpower(*BANDS['alpha'])   # 8–13 Hz
-    beta  = bandpower(*BANDS['beta'])    # 13–35 Hz
+    # ── bandpowers: gemiddelde over de samples van dit event ──
+    delta = float(band_mean['delta'][start:end].mean())
+    theta = float(band_mean['theta'][start:end].mean())
+    alpha = float(band_mean['alpha'][start:end].mean())
+    beta  = float(band_mean['beta' ][start:end].mean())
     total = delta + theta + alpha + beta + 1e-10  # +kleine waarde om /0 te vermijden
 
     # fast/slow ratio: hoe actief was het EEG?
@@ -429,19 +400,18 @@ def process_one_night(edf_path, subject_id, night_id):
     signals = preprocess_signals(raw)
     n_samp  = len(signals[EEG_CH[0]])  # totaal aantal samples in de nacht
 
-    # ── stap 2: CWT berekenen ──
+    # ── stap 2+3: CWT berekenen + ridge extraheren (streaming) ──
     # we gebruiken het gemiddelde van links en rechts EEG
     # dit vermindert ruis en artefacten die maar één kant raken
     print(f"  [2/6] CWT berekenen ({n_samp/SFREQ/3600:.1f} uur data)...")
     eeg_avg = (signals[EEG_CH[0]] + signals[EEG_CH[1]]) / 2.0
 
-    # bereken de volledige power matrix: (n_freqs × n_samples)
-    # dit is de zwaarste berekening — kan 1–5 minuten duren per nacht
-    power = compute_morlet_tf(eeg_avg, SFREQ, FREQS)
-
-    # ── stap 3: ridge extraheren ──
-    print("  [3/6] Ridge extraheren...")
-    ridge_freq, ridge_power = extract_ridge(power, FREQS)
+    # streaming CWT: berekent ridge + bandpowers zonder volledige power matrix
+    # geheugen: ~168 MB i.p.v. ~1.93 GiB
+    ridge_freq, ridge_power, band_mean = compute_morlet_tf_streaming(
+        eeg_avg, SFREQ, FREQS, BANDS
+    )
+    print("  [3/6] Ridge extraheren... (gedaan tijdens CWT)")
 
     # ── stap 4: freq_shift berekenen ──
     print("  [4/6] Lokale baseline berekenen...")
@@ -473,7 +443,7 @@ def process_one_night(edf_path, subject_id, night_id):
     records = []
     for start, end in events:
         feat = extract_event_features(
-            start, end, power, FREQS,
+            start, end, band_mean,
             ridge_freq, ridge_power, freq_shift,
             emg_avg, acc, SFREQ
         )
@@ -522,7 +492,8 @@ def run_all_nights():
     """
     # zoek alleen naar bestanden die eindigen op _psg.edf
     # dit sluit BATT.edf en andere niet-PSG bestanden uit
-    all_edf = sorted(base_dir.rglob("*_psg.edf"))
+    # filter op T0_ zodat alleen baseline nachten worden verwerkt
+    all_edf = sorted(f for f in base_dir.rglob("*_psg.edf") if "_T0_" in f.name)
     
     print(f"Gevonden: {len(all_edf)} PSG bestanden")
     
