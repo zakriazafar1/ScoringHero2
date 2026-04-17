@@ -18,9 +18,13 @@ from tqdm import tqdm
 # Configuratie — alle parameters op één plek
 # ══════════════════════════════════════════════════════════════════════════════
 
-base_dir   = Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR")
+BASE_DIRS = [
+    Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR"),
+    Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\Prezens"),
+    Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\SAV"),
+]
 output_dir = Path(r"C:\Users\zafar\Documents\bnbd_output4")
-output_dir.mkdir(exist_ok=True)   # maak output map aan als die nog niet bestaat
+output_dir.mkdir(exist_ok=True)
 
 MAX_PARTICIPANTS = 3      # hoeveel deelnemers je wilt verwerken (5 voor pilot)
 
@@ -476,19 +480,10 @@ def process_one_night(edf_path, subject_id, night_id):
 # Fase 9 — Batch verwerking van alle nachten
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_all_nights():
-
+def run_all_nights(base_dir):
     """
-    Zoekt alle EDF bestanden op, verwerkt ze één voor één,
+    Zoekt alle EDF bestanden op in base_dir, verwerkt ze één voor één,
     en slaat resultaten op per nacht en als één grote master tabel.
-
-    Structuur van de data map:
-    base_dir/
-    └── sub_001/
-        └── nacht_1.edf
-        └── nacht_2.edf
-    └── sub_002/
-        └── ...
     """
     # zoek alleen naar bestanden die eindigen op _psg.edf
     # dit sluit BATT.edf en andere niet-PSG bestanden uit
@@ -594,18 +589,34 @@ def qc_summary(master):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import winsound, time
 
-    # voer de volledige pipeline uit
-    master = run_all_nights()
+    all_masters = []
 
-    # toon kwaliteitscontrole als er events zijn
-    if not master.empty:
-        qc_summary(master)
-        print("\nKolommen in master tabel:")
-        print(master.columns.tolist())
-        print("\nEerste 3 events:")
-        print(master.head(3).to_string())
+    for idx, base_dir in enumerate(BASE_DIRS):
+        group_name = base_dir.name
+        print(f"\n{'#'*60}")
+        print(f"# GROEP {idx+1}/3: {group_name}")
+        print(f"{'#'*60}")
 
-    # ── volgende stap: clustering ──
-    # master is nu klaar voor UMAP + HDBSCAN
-    # zie microarousal_pipeline.py voor cluster_events() en plot_umap()
+        master = run_all_nights(base_dir)
+
+        if not master.empty:
+            master['group'] = group_name
+            all_masters.append(master)
+            qc_summary(master)
+
+        # notificatie: beep + bericht
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        if idx < len(BASE_DIRS) - 1:
+            next_group = BASE_DIRS[idx + 1].name
+            print(f"\n>>> KLAAR MET {group_name} — nu start {next_group} <<<\n")
+        else:
+            print(f"\n>>> ALLE GROEPEN KLAAR <<<\n")
+
+    if all_masters:
+        combined = pd.concat(all_masters, ignore_index=True)
+        combined_out = output_dir / "master_events_ALL_GROUPS.csv"
+        combined.to_csv(combined_out, index=False)
+        print(f"Gecombineerde master tabel: {combined_out}")
+        print(f"Totaal events alle groepen: {len(combined)}")
