@@ -52,7 +52,7 @@ BANDS = {
 }
 
 ROLLING_SEC            = 60.0   # baseline venster: vergelijk met de vorige 60 seconden
-AROUSAL_FREQ_THRESHOLD = 0.5    # ridge moet > 0.5 Hz boven baseline springen = activatie
+AROUSAL_FREQ_THRESHOLD = 0.731    # ridge moet > 1 Hz boven baseline springen = activatie
 AROUSAL_MIN_DUR        = 1.0    # event moet minimaal 1 seconden duren
 AROUSAL_MAX_DUR        = 20.0   # event mag maximaal 20 seconden duren
 

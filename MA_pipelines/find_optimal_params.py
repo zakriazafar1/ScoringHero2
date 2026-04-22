@@ -39,13 +39,19 @@ BASE_DIRS = [
     Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR"),
     Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\SAV"),
 ]
-CACHE_DIR = Path(r"C:\Users\zafar\Documents\bnbd_output_mc_params")
+CACHE_DIR    = Path(r"C:\Users\zafar\Documents\bnbd_output_mc_params")
+RESULTS_DIR  = Path(r"C:\Users\zafar\Documents\bnbd_output_mc_params_no_outliers")
 CACHE_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
 
 # ── Proefpersoon groepen ──────────────────────────────────────────────────────
+# Uitgesloten op basis van diagnose_results.py:
+#   14359 — 101 events/uur (outlier, rest 42-90)
+#   05578 — mean_ridge_freq 11.09 Hz (outlier, rest 4-8 Hz)
+#   21614 — 18 events/uur + slechts 1 nacht gecached (N1)
 GROUP_A_IDS = [
     "15103",
-    "14359",
+    # "14359",   # outlier: 101 events/uur
     "16775",
     "03554",
     "05830",
@@ -54,7 +60,7 @@ GROUP_A_IDS = [
     "16924",
     "17322",
     "18996",
-    "05578",
+    # "05578",   # outlier: mean_ridge_freq 11.09 Hz
     "19330"
 ]
 
@@ -62,7 +68,7 @@ GROUP_B_IDS = [
     "18500",
     "20362",
     "20736",
-    "21614",
+    # "21614",   # outlier: 18 events/uur, slechts 1 nacht
     "21962",
     "23343"
 ]
@@ -94,7 +100,7 @@ N_BOOTSTRAP = 30
 DS_FREQ = 4.0   # Hz
 
 # ── Event detectie grenzen ────────────────────────────────────────────────────
-MIN_DUR_SEC   = 2.0
+MIN_DUR_SEC   = 1.0
 MAX_DUR_SEC   = 30.0
 MERGE_GAP_SEC = 1.0
 
@@ -394,7 +400,7 @@ def run_step2_monte_carlo() -> tuple[dict, pd.DataFrame]:
         })
 
     df = pd.DataFrame(results)
-    df.to_csv(CACHE_DIR / "mc_results_eph.csv", index=False)
+    df.to_csv(RESULTS_DIR / "mc_results_eph.csv", index=False)
 
     beste     = df.loc[df['score'].idxmax()]
     print(f"\n{'='*60}")
@@ -417,7 +423,7 @@ def run_step2_monte_carlo() -> tuple[dict, pd.DataFrame]:
         'n_mc_iterations':        N_MONTE_CARLO,
         'n_bootstrap':            N_BOOTSTRAP,
     }
-    with open(CACHE_DIR / "optimal_params_eph.json", 'w') as f:
+    with open(RESULTS_DIR / "optimal_params_eph.json", 'w') as f:
         json.dump(optimal, f, indent=2)
     print(f"Opgeslagen: optimal_params_eph.json")
 
@@ -544,7 +550,7 @@ def run_step2_monte_carlo_features() -> tuple[dict, pd.DataFrame]:
     sids_a        = list(shifts_a.keys())
     sids_b        = list(shifts_b.keys())
     n_b           = len(sids_b)
-    FEATURE_COLS  = ['mean_ridge_freq', 'mean_freq_shift', 'duration']
+    FEATURE_COLS  = ['mean_ridge_freq', 'mean_freq_shift']
     results       = []
 
     for _ in tqdm(range(N_MONTE_CARLO), desc="MC iteraties"):
@@ -610,8 +616,6 @@ def run_step2_monte_carlo_features() -> tuple[dict, pd.DataFrame]:
                                  if d_per_feature['mean_ridge_freq'] else 0.0,
             'mean_d_freq_shift': float(np.mean(d_per_feature['mean_freq_shift']))
                                  if d_per_feature['mean_freq_shift'] else 0.0,
-            'mean_d_duration':   float(np.mean(d_per_feature['duration']))
-                                 if d_per_feature['duration'] else 0.0,
             'mean_ridge_b':      float(df_b['mean_ridge_freq'].mean())
                                  if 'mean_ridge_freq' in df_b.columns else 0.0,
             'mean_shift_b':      float(df_b['mean_freq_shift'].mean())
@@ -623,7 +627,7 @@ def run_step2_monte_carlo_features() -> tuple[dict, pd.DataFrame]:
         return None, pd.DataFrame()
 
     df = pd.DataFrame(results)
-    df.to_csv(CACHE_DIR / "mc_results_features.csv", index=False)
+    df.to_csv(RESULTS_DIR / "mc_results_features.csv", index=False)
 
     beste     = df.loc[df['score'].idxmax()]
     print(f"\n{'='*60}")
@@ -633,7 +637,6 @@ def run_step2_monte_carlo_features() -> tuple[dict, pd.DataFrame]:
     print(f"  Score:                {beste['score']:.3f}")
     print(f"  Cohen's d ridge_freq: {beste['mean_d_ridge_freq']:.3f}")
     print(f"  Cohen's d freq_shift: {beste['mean_d_freq_shift']:.3f}")
-    print(f"  Cohen's d duration:   {beste['mean_d_duration']:.3f}")
     print(f"{'='*60}")
 
     optimal = {
@@ -642,11 +645,10 @@ def run_step2_monte_carlo_features() -> tuple[dict, pd.DataFrame]:
         'score':                   round(float(beste['score']), 3),
         'cohens_d_ridge_freq':     round(float(beste['mean_d_ridge_freq']), 3),
         'cohens_d_freq_shift':     round(float(beste['mean_d_freq_shift']), 3),
-        'cohens_d_duration':       round(float(beste['mean_d_duration']), 3),
         'n_mc_iterations':         N_MONTE_CARLO,
         'n_bootstrap':             N_BOOTSTRAP,
     }
-    with open(CACHE_DIR / "optimal_params_features.json", 'w') as f:
+    with open(RESULTS_DIR / "optimal_params_features.json", 'w') as f:
         json.dump(optimal, f, indent=2)
     print(f"Opgeslagen: optimal_params_features.json")
 
@@ -682,7 +684,7 @@ def plot_results(df: pd.DataFrame, optimal: dict, score_col: str = 'score'):
     ax2    = axes[1]
     grouped = [df[df['rolling_sec'] == rv][score_col].values
                for rv in rolling_vals]
-    bp = ax2.boxplot(grouped, labels=[str(int(r)) for r in rolling_vals],
+    bp = ax2.boxplot(grouped, tick_labels=[str(int(r)) for r in rolling_vals],
                      patch_artist=True)
     for patch, col in zip(bp['boxes'], colors):
         patch.set_facecolor(col)
@@ -721,7 +723,7 @@ def plot_results(df: pd.DataFrame, optimal: dict, score_col: str = 'score'):
         ax3.set_title("Groepsseparatie events/uur")
 
     plt.tight_layout()
-    out = CACHE_DIR / "mc_parameter_search.png"
+    out = RESULTS_DIR / "mc_parameter_search.png"
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.show()
     print(f"Plot opgeslagen: {out}")
