@@ -37,6 +37,7 @@ import matplotlib.pyplot as plt
 
 BASE_DIRS = [
     Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\NSR"),
+    Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\Prezens"),
     Path(r"\\vs03.herseninstituut.knaw.nl\VS03-SandC-2\raw\bnbd\Data\eeg\SAV"),
 ]
 CACHE_DIR    = Path(r"C:\Users\zafar\Documents\bnbd_output_mc_params")
@@ -45,32 +46,28 @@ CACHE_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
 # ── Proefpersoon groepen ──────────────────────────────────────────────────────
-# Uitgesloten op basis van diagnose_results.py:
-#   14359 — 101 events/uur (outlier, rest 42-90)
-#   05578 — mean_ridge_freq 11.09 Hz (outlier, rest 4-8 Hz)
-#   21614 — 18 events/uur + slechts 1 nacht gecached (N1)
 GROUP_A_IDS = [
-    "15103",
-    # "14359",   # outlier: 101 events/uur
-    "16775",
     "03554",
-    "05830",
-    "17688",
-    "16956",
+    "05578",   # outlier: mean_ridge_freq 11.09 Hz
+    "14359",   # outlier: 101 events/uur
+    "15103",
+    "16775",
     "16924",
+    "16956",
     "17322",
-    "18996",
-    # "05578",   # outlier: mean_ridge_freq 11.09 Hz
-    "19330"
+    "17688",
+    "19330",
+    "22853",   # Prezens
 ]
 
 GROUP_B_IDS = [
     "18500",
     "20362",
     "20736",
-    # "21614",   # outlier: 18 events/uur, slechts 1 nacht
+    "21614",   # outlier: 18 events/uur, slechts 1 nacht
     "21962",
-    "23343"
+    "23264",   # Prezens
+    "23343",
 ]
 
 # ── Signaalparameters ─────────────────────────────────────────────────────────
@@ -89,7 +86,7 @@ BANDS  = {
 
 # ── Monte Carlo zoekbereik ────────────────────────────────────────────────────
 N_MONTE_CARLO = 500
-ROLLING_GRID  = [20, 30, 45, 60, 90, 120, 150, 180]   # seconden
+ROLLING_GRID  = [30, 45, 60, 90, 120, 150, 180, 200, 220]   # seconden
 THRESHOLD_MIN = 0.1
 THRESHOLD_MAX = 3.0
 
@@ -355,13 +352,13 @@ def run_step2_monte_carlo() -> tuple[dict, pd.DataFrame]:
     shifts_b = build_shift_table(ridges_b)
 
     def eph_subject(sid, shifts, r_idx, threshold):
-        vals = []
+        total_events = 0
+        total_hours  = 0.0
         for night_shifts in shifts[sid]:
-            shift = night_shifts[r_idx]
-            n_ev  = count_events_fast(shift, threshold, sfreq=DS_FREQ)
-            hours = len(shift) / DS_FREQ / 3600.0
-            vals.append(n_ev / max(hours, 0.1))
-        return float(np.mean(vals))
+            shift         = night_shifts[r_idx]
+            total_events += count_events_fast(shift, threshold, sfreq=DS_FREQ)
+            total_hours  += len(shift) / DS_FREQ / 3600.0
+        return total_events / max(total_hours, 0.1)
 
     sids_a = list(shifts_a.keys())
     sids_b = list(shifts_b.keys())
